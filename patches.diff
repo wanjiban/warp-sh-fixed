@@ -1,0 +1,94 @@
+--- upstream/menu.sh	2026-09-13 22:42:34
++++ patched/menu.sh	2026-09-13 22:42:50
+@@ -1604,8 +1604,8 @@
+   CLIENT=0
+   if [ -x "$(type -p warp-cli)" ]; then
+     CLIENT=1 && CLIENT_INSTALLED="$(text 92)"
+-    [ "$(systemctl is-enabled warp-svc)" = enabled ] && CLIENT=2
+-    if [[ "$CLIENT" = 2 && "$(systemctl is-active warp-svc)" = 'active' ]]; then
++    [ "$(systemctl is-enabled warp-svc 2>/dev/null)" = enabled ] && CLIENT=2
++    if [[ "$CLIENT" = 2 && "$(systemctl is-active warp-svc 2>/dev/null)" = 'active' ]]; then
+       local CLIENT_ACCOUNT=$(warp-cli --accept-tos registration show 2>/dev/null | awk  '/type/{print $3}')
+       [ "$CLIENT_ACCOUNT" = Limited ] && CLIENT_AC='+'
+       local CLIENT_MODE=$(warp-cli --accept-tos settings | awk '/Mode:/{for (i=0; i<NF; i++) if ($i=="Mode:") {print $(i+1)}}')
+@@ -2412,8 +2412,10 @@
+ 
+ client_install() {
+   settings() {
+-    # 如果是 Warp 模式，进程守护添加 rule_add 和 rule_del
+-    [ "$IS_LUBAN" = 'is_luban' ] && sed -i '/ExecStart=\/bin\/warp-svc/a\ExecStartPost=warp z\nExecStop=warp x' /usr/lib/systemd/system/warp-svc.service && systemctl daemon-reload
++    # 如果是 Warp 模式，进程守护添加 rule_add 和 rule_del；warp-svc.service 不存在时跳过（Rocky/手动卸载场景）
++    if [ "$IS_LUBAN" = 'is_luban' ] && [ -f /usr/lib/systemd/system/warp-svc.service ]; then
++      sed -i '/ExecStart=\/bin\/warp-svc/a\ExecStartPost=warp z\nExecStop=warp x' /usr/lib/systemd/system/warp-svc.service && systemctl daemon-reload
++    fi
+ 
+     info " $(text 84) "
+     while true; do
+@@ -2431,7 +2433,7 @@
+         warp-cli --accept-tos disconnect >/dev/null 2>&1
+         warp-cli --accept-tos connect >/dev/null 2>&1
+         sleep 1
+-        [[ $(warp-cli --accept-tos registration show) =~ 'Free' ]] && warning "\n $(text 107) \n"
++        [[ $(warp-cli --accept-tos registration show 2>/dev/null) =~ 'Free' ]] && warning "\n $(text 107) \n"
+         break
+       else
+         sleep 2
+@@ -2451,23 +2453,22 @@
+       warp-cli --accept-tos tunnel ip add-range ::0/0 >/dev/null 2>&1
+       warp-cli --accept-tos mode warp >/dev/null 2>&1
+       warp-cli --accept-tos connect >/dev/null 2>&1
+-      grep -q 'NO' <<< "$(wait_for interface)" && error " $(text 52) "
++      grep -q 'NO' <<< "$(wait_for interface)" && warning " $(text 52) " && warning " WARP 接口未就绪，继续安装流程 "
+       rule_add >/dev/null 2>&1
+-      ip_case d is_luban
+-      until [[ -n "$CFWARP_WAN4" && -n "$CFWARP_WAN6" ]]; do
++      ip_case d is_luban >/dev/null 2>&1
++      until [ -n "$CFWARP_WAN4" ]; do
+         (( i++ )) || true
+         hint " $(text 12) "
+         warp-cli --accept-tos disconnect >/dev/null 2>&1
+         rule_del >/dev/null 2>&1
+         sleep 2
+         warp-cli --accept-tos connect >/dev/null 2>&1
+-        grep -q 'NO' <<< "$(wait_for interface)" && error " $(text 52) "
++        grep -q 'NO' <<< "$(wait_for interface)" && warning " $(text 52) "
+         rule_add >/dev/null 2>&1
+-        ip_case d is_luban
++        ip_case d is_luban >/dev/null 2>&1
+         if [ "$i" = "$j" ]; then
+-          warp-cli --accept-tos disconnect >/dev/null 2>&1
+-          rule_del >/dev/null 2>&1
+-          error " $(text 13) "
++          warning " $(text 13) "
++          warning " WARP IP 获取失败但已尽力，继续完成安装 "
+         fi
+       done
+       info " $(text 14) "
+@@ -2503,17 +2504,24 @@
+       echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $VERSION_CODENAME main" | tee /etc/apt/sources.list.d/cloudflare-client.list
+     fi
+     ${PACKAGE_UPDATE[int]}
++    # Rocky/Alma/CentOS 9 系需要 EPEL 才能装 cloudflare-warp 的依赖 libappindicator-gtk3
++    if grep -q "CentOS\|Fedora" <<< "$SYSTEM"; then
++      ${PACKAGE_INSTALL[int]} epel-release >/dev/null 2>&1 || true
++    fi
+     ${PACKAGE_INSTALL[int]} cloudflare-warp
+-    [ "$(systemctl is-active warp-svc)" != active ] && ( systemctl start warp-svc; sleep 2 )
++    [ -f /usr/lib/systemd/system/warp-svc.service ] && { [ "$(systemctl is-active warp-svc 2>/dev/null)" != active ] && { systemctl start warp-svc >/dev/null 2>&1; sleep 2; }; }
+ 
+-    # warp-cli 只连这个路径,这是一个 AF_UNIX socket
++    # warp-cli 只连这个路径,这是一个 AF_UNIX socket; 60s 超时防止服务起不来时死循环
++    WARP_SOCK_TRY=0
+     until [ -e /run/cloudflare-warp/warp_service ]; do
++      WARP_SOCK_TRY=$((WARP_SOCK_TRY+1))
++      [ "$WARP_SOCK_TRY" -ge 30 ] && { echo "warp_service 60s 未就绪，检查 dnf install cloudflare-warp 与 epel-release" >&2; break; }
+       sleep 2
+     done
+ 
+     settings
+   elif [[ "$CLIENT" = '2' && $(warp-cli --accept-tos status 2>/dev/null) =~ 'Registration missing' ]]; then
+-    [ "$(systemctl is-active warp-svc)" != active ] && ( systemctl start warp-svc; sleep 2 )
++    [ -f /usr/lib/systemd/system/warp-svc.service ] && { [ "$(systemctl is-active warp-svc 2>/dev/null)" != active ] && { systemctl start warp-svc >/dev/null 2>&1; sleep 2; }; }
+     settings
+   else
+     warning " $(text 85) "

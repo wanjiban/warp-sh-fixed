@@ -1,0 +1,241 @@
+--- patched/menu.sh	2026-09-13 22:42:50
++++ fixed/menu.sh	2026-09-13 23:05:09
+@@ -1,4 +1,22 @@
+ #!/usr/bin/env bash
++
++# ============================================================================
++# 本文件 = fscarmen/warp menu.sh + N2/N3 补丁 + 审核修复（local fixed build）
++#
++# 相对 N2/N3 补丁版的改动（审核项见 AUDIT.md）：
++#   F4   Luban 取 IP 循环补上出口：i=j 时 warning + CFWARP_IP_FAILED=1 + break，
++#        避免"拿不到 WARP IPv4 就永久挂死"（上游是 error 退出，补丁版误删了唯一出口）
++#   F2   Luban 规则持久化不再 sed vendor unit（EL9 上路径不存在 / 升级被覆盖 /
++#        客户端会自行 DelRule 51820），改为独立幂等单元 warp-rules.service
++#   F5/6 warp-svc 存在性改用 systemctl show -p FragmentPath，服务未起时直接 start
++#   P1-1 /usr/bin/warp 在安装开始时即创建，中途失败也不再是"没有 warp 命令"的半成品
++#   P1-2 末尾按真实状态输出：未就绪时打印排查指引，不再无条件显示 Congratulations
++#   P2-2 EPEL 装完显式校验仓库可用性，包管理器失败会给出明确 warning
++#   P2-4 "Registration missing" 大小写：新版客户端输出 "Registration Missing"，
++#        上游只匹配小写导致"已安装但注册丢失"的再入分支永远不触发（真机验证）
++#   P2-5 顶部 `[ "$CLIENT" -ge 2 ] && error` 与下面的再入 elif 互相矛盾，
++#        使"注册丢失后重跑 menu.sh l 自愈"成为死代码；已放行该情况
++# ============================================================================
+ 
+ # 当前脚本版本号
+ VERSION='3.2.7'
+@@ -1643,6 +1661,88 @@
+   ip -6 rule show | grep -q "suppress_prefixlength 0" && ip -6 rule delete table main suppress_prefixlength 0
+ }
+ 
++# ── 以下三个函数为本版新增：修正上游/补丁版在 EL9(RPM) 上的三处硬编码路径与"假成功"问题 ──
++
++# warp-svc 单元真实路径（Debian/Ubuntu 在 /usr/lib/systemd/system，EL9 RPM 在 /etc/systemd/system）
++warp_svc_unit() {
++  local FRAG
++  FRAG="$(systemctl show -p FragmentPath --value warp-svc 2>/dev/null)"
++  [ -n "$FRAG" ] && [ -f "$FRAG" ] && printf '%s' "$FRAG"
++}
++
++# 服务没起就拉起来；不再用 [ -f /usr/lib/... ] 判存在性（该路径在 EL9 上恒不存在 → 该行永不执行）
++warp_svc_start() {
++  [ -n "$(warp_svc_unit)" ] || { warning " warp-svc.service 未找到，cloudflare-warp 可能没装上 "; return 1; }
++  [ "$(systemctl is-active warp-svc 2>/dev/null)" = 'active' ] && return 0
++  systemctl start warp-svc >/dev/null 2>&1
++  sleep 2
++}
++
++# Luban 模式的策略路由持久化。
++# 上游做法是 sed 往 vendor unit 里插 ExecStartPost=warp z / ExecStop=warp x，但有三个坑：
++#   1) 路径写死 /usr/lib/systemd/system/warp-svc.service，EL9 RPM 上该文件不存在（真机验证）；
++#   2) dnf 升级 cloudflare-warp 时 %post 会 cp 覆盖 /etc/systemd/system/warp-svc.service，hook 丢失；
++#   3) 云端客户端自身在网络变化/重连时会 DelRule { tables: [51820] }（N2 journal 实证），规则会被吃掉。
++# 故改为写入独立、幂等的 warp-rules.service（已存在则不覆盖，尊重既有自建单元）。
++luban_rules_unit() {
++  local RULES_SH=/usr/local/bin/warp-rules.sh
++  local RULES_UNIT=/etc/systemd/system/warp-rules.service
++
++  if [ ! -f "$RULES_SH" ]; then
++    cat > "$RULES_SH" <<'EOT'
++#!/bin/bash
++# WARP (Luban / mode warp) 策略路由：add 安装规则，del 清理规则
++IF=CloudflareWARP; IP=172.16.0.2; TBL=51820
++
++if [ "$1" = 'del' ]; then
++  ip -4 rule show | grep -q "from $IP" && ip -4 rule delete from $IP lookup $TBL
++  ip -4 rule show | grep -q "suppress_prefixlength 0" && ip -4 rule delete table main suppress_prefixlength 0
++  ip -6 rule show | grep -q "oif $IF" && ip -6 rule delete oif $IF lookup $TBL
++  ip -6 rule show | grep -q "suppress_prefixlength 0" && ip -6 rule delete table main suppress_prefixlength 0
++  exit 0
++fi
++
++# 开机时接口可能比 warp-svc 服务晚就绪（客户端要连接云端后才建接口），最多等 30s
++for _ in $(seq 1 30); do [ -d "/sys/class/net/$IF" ] && break; sleep 1; done
++[ -d "/sys/class/net/$IF" ] || { echo "$IF 接口未就绪" >&2; exit 1; }
++
++ip route replace default dev $IF table $TBL 2>/dev/null || true
++ip -6 route replace default dev $IF table $TBL 2>/dev/null || true
++ip rule show | grep -q "from $IP lookup $TBL" || ip rule add from $IP lookup $TBL
++ip rule show | grep -q "lookup main suppress_prefixlength 0" || ip rule add table main suppress_prefixlength 0
++ip -6 rule show | grep -q "oif $IF lookup $TBL" || ip -6 rule add oif $IF lookup $TBL
++ip -6 rule show | grep -q "lookup main suppress_prefixlength 0" || ip -6 rule add table main suppress_prefixlength 0
++EOT
++    chmod +x "$RULES_SH"
++  fi
++
++  if [ ! -f "$RULES_UNIT" ]; then
++    cat > "$RULES_UNIT" <<'EOT'
++[Unit]
++Description=WARP (Luban) policy routing rules
++After=warp-svc.service
++Wants=warp-svc.service
++
++[Service]
++Type=oneshot
++RemainAfterExit=yes
++ExecStart=/usr/local/bin/warp-rules.sh add
++ExecStop=/usr/local/bin/warp-rules.sh del
++
++[Install]
++WantedBy=multi-user.target
++EOT
++  fi
++
++  systemctl daemon-reload >/dev/null 2>&1
++  systemctl enable warp-rules.service >/dev/null 2>&1
++  # 接口没就绪时不要拉起（否则会留下 failed 状态）；已就绪则立刻应用一次规则
++  if ip link show CloudflareWARP >/dev/null 2>&1; then
++    systemctl restart warp-rules.service >/dev/null 2>&1 \
++      || warning " warp-rules.service 启动失败，请检查 /usr/local/bin/warp-rules.sh "
++  fi
++}
++
+ # 输入 Linux Client 端口,先检查默认的40000是否被占用,限制4-5位数字,准确匹配空闲端口
+ input_port() {
+   i=5
+@@ -2412,11 +2512,6 @@
+ 
+ client_install() {
+   settings() {
+-    # 如果是 Warp 模式，进程守护添加 rule_add 和 rule_del；warp-svc.service 不存在时跳过（Rocky/手动卸载场景）
+-    if [ "$IS_LUBAN" = 'is_luban' ] && [ -f /usr/lib/systemd/system/warp-svc.service ]; then
+-      sed -i '/ExecStart=\/bin\/warp-svc/a\ExecStartPost=warp z\nExecStop=warp x' /usr/lib/systemd/system/warp-svc.service && systemctl daemon-reload
+-    fi
+-
+     info " $(text 84) "
+     while true; do
+       ((REGISTER_ERROR_TIME++))
+@@ -2469,9 +2564,14 @@
+         if [ "$i" = "$j" ]; then
+           warning " $(text 13) "
+           warning " WARP IP 获取失败但已尽力，继续完成安装 "
++          CFWARP_IP_FAILED=1
++          break
+         fi
+       done
+-      info " $(text 14) "
++      [ -z "$CFWARP_IP_FAILED" ] && info " $(text 14) "
++      # Luban 模式：接口已就绪，安装独立幂等单元维护 rule_add / rule_del
++      # （不再 sed vendor unit，原因见 luban_rules_unit 注释）
++      luban_rules_unit
+     else
+       warp-cli --accept-tos mode proxy >/dev/null 2>&1
+       warp-cli --accept-tos proxy port "$PORT" >/dev/null 2>&1
+@@ -2480,8 +2580,13 @@
+     fi
+   }
+ 
+-  # 禁止安装的情况: 1. 重复安装; 2. 非 AMD64 CPU 架构; 3. 非 Ubuntu / Debian / CentOS 系统
+-  [ "$CLIENT" -ge 2 ] && error " $(text 85) "
++  # 禁止安装的情况: 1. 重复安装（已注册且可用）; 2. 非 AMD64 CPU 架构; 3. 非 Ubuntu / Debian / CentOS 系统
++  # 注意：上游这里直接 error，会让下面「CLIENT=2 且注册丢失 → 重新注册」的 elif 变成死代码
++  #      （真机验证：warp-cli registration delete 后再跑 `menu.sh l` 会直接以 text 85 退出）。
++  #      这里放行"注册丢失"这一种情况，让再跑一次即可自愈。
++  if [ "$CLIENT" -ge 2 ] && ! [[ $(warp-cli --accept-tos status 2>/dev/null) =~ [Rr]egistration\ [Mm]issing ]]; then
++    error " $(text 85) "
++  fi
+   [[ ! "$ARCHITECTURE" =~ ^(arm64|amd64)$ ]] && error " $(text 101) "
+   [[ ! "$SYSTEM" =~ Ubuntu|Debian|CentOS ]] && error " $(text 4) "
+ 
+@@ -2492,6 +2597,11 @@
+   [ "$IS_LUBAN" != 'is_luban' ] && input_port
+   start=$(date +%s)
+   mkdir -p /etc/wireguard/ >/dev/null 2>&1
++  # 先把脚本落到 /etc/wireguard 并建好 warp 命令：后续任何 exit / 挂死 / 断线 / Ctrl-C 都不会再留下
++  # "装了一半却没有 warp 命令"的状态（这是上游 report 里"安装不完整"的机制性根因）
++  mv -f "$0" /etc/wireguard/menu.sh >/dev/null 2>&1
++  chmod +x /etc/wireguard/menu.sh >/dev/null 2>&1
++  ln -sf /etc/wireguard/menu.sh /usr/bin/warp
+   if [ "$CLIENT" = 0 ]; then
+     info " $(text 83) "
+     if grep -q "CentOS\|Fedora" <<< "$SYSTEM"; then
+@@ -2507,28 +2617,34 @@
+     # Rocky/Alma/CentOS 9 系需要 EPEL 才能装 cloudflare-warp 的依赖 libappindicator-gtk3
+     if grep -q "CentOS\|Fedora" <<< "$SYSTEM"; then
+       ${PACKAGE_INSTALL[int]} epel-release >/dev/null 2>&1 || true
++      # 装了 epel-release 不等于 EPEL 仓库可用（可能被 disable / 镜像不可达），显式校验一次
++      dnf -q --disablerepo='*' --enablerepo='epel*' repolist >/dev/null 2>&1 \
++        || warning " EPEL 仓库不可用，cloudflare-warp 可能因缺 libappindicator-gtk3 而安装失败 "
+     fi
+-    ${PACKAGE_INSTALL[int]} cloudflare-warp
+-    [ -f /usr/lib/systemd/system/warp-svc.service ] && { [ "$(systemctl is-active warp-svc 2>/dev/null)" != active ] && { systemctl start warp-svc >/dev/null 2>&1; sleep 2; }; }
++    ${PACKAGE_INSTALL[int]} cloudflare-warp || warning " cloudflare-warp 安装失败，请检查上方包管理器输出 "
++    [ -x "$(type -p warp-cli)" ] || warning " warp-cli 未就绪，本次安装大概率未生效 "
++    warp_svc_start
+ 
+     # warp-cli 只连这个路径,这是一个 AF_UNIX socket; 60s 超时防止服务起不来时死循环
+     WARP_SOCK_TRY=0
+     until [ -e /run/cloudflare-warp/warp_service ]; do
+       WARP_SOCK_TRY=$((WARP_SOCK_TRY+1))
+-      [ "$WARP_SOCK_TRY" -ge 30 ] && { echo "warp_service 60s 未就绪，检查 dnf install cloudflare-warp 与 epel-release" >&2; break; }
++      [ "$WARP_SOCK_TRY" -ge 30 ] && { warning " /run/cloudflare-warp/warp_service 60s 未就绪：检查 dnf install cloudflare-warp（Rocky 需先装 epel-release）与 systemctl status warp-svc "; break; }
+       sleep 2
+     done
+ 
+     settings
+-  elif [[ "$CLIENT" = '2' && $(warp-cli --accept-tos status 2>/dev/null) =~ 'Registration missing' ]]; then
+-    [ -f /usr/lib/systemd/system/warp-svc.service ] && { [ "$(systemctl is-active warp-svc 2>/dev/null)" != active ] && { systemctl start warp-svc >/dev/null 2>&1; sleep 2; }; }
++  # 注意大小写：新版客户端输出 "Registration Missing"（大写 M），老版是 "Registration missing"，
++  # 上游只匹配小写 → 该再入分支在新客户端上永远不触发（真机 2026.7.1377 验证），这里两种都匹配
++  elif [[ "$CLIENT" = '2' && $(warp-cli --accept-tos status 2>/dev/null) =~ [Rr]egistration\ [Mm]issing ]]; then
++    warp_svc_start
+     settings
+   else
+     warning " $(text 85) "
+   fi
+ 
+-  # 创建再次执行的软链接快捷方式，再次运行可以用 warp 指令,设置默认语言
+-  mv -f $0 /etc/wireguard/menu.sh >/dev/null 2>&1
++  # 创建再次执行的软链接快捷方式（开头已建，这里再兜一次），设置默认语言
++  mv -f "$0" /etc/wireguard/menu.sh >/dev/null 2>&1
+   chmod +x /etc/wireguard/menu.sh >/dev/null 2>&1
+   ln -sf /etc/wireguard/menu.sh /usr/bin/warp && info " $(text 38) "
+   echo "$L" >/etc/wireguard/language
+@@ -2537,7 +2653,28 @@
+   local CLIENT_ACCOUNT=$(warp-cli --accept-tos registration show 2>/dev/null | awk  '/type/{print $3}')
+   [ "$CLIENT_ACCOUNT" = Limited ] && CLIENT_AC='+'
+ 
++  # 真实状态判定，避免"包装不上/没连上"也打印 Congratulations
++  WARP_OK=1
++  [ -x "$(type -p warp-cli)" ] || WARP_OK=0
++  [ -e /run/cloudflare-warp/warp_service ] || WARP_OK=0
+   if [ "$IS_LUBAN" = 'is_luban' ]; then
++    ip link show CloudflareWARP >/dev/null 2>&1 || WARP_OK=0
++    { [ -n "$CFWARP_WAN4" ] && [ -z "$CFWARP_IP_FAILED" ]; } || WARP_OK=0
++  fi
++
++  if [ "$WARP_OK" = 0 ]; then
++    end=$(date +%s)
++    echo -e "\n==============================================================\n"
++    warning " 安装未完成或 WARP 未正常连通，请按下面几项排查： "
++    warning " 1) 包是否装上: rpm -q cloudflare-warp  或  apt list --installed cloudflare-warp "
++    warning " 2) 服务状态:   systemctl status warp-svc "
++    warning " 3) 客户端状态: warp-cli --accept-tos status "
++    [ "$IS_LUBAN" = 'is_luban' ] && warning " 4) 接口与规则: ip link show CloudflareWARP ; ip -4 rule show "
++    if [ "$IS_LUBAN" = 'is_luban' ]; then
++      info " WARP$CLIENT_AC IPv4: $CFWARP_WAN4  IPv6: $CFWARP_WAN6 "
++    fi
++    warning " 修好后可重新执行: warp l \n"
++  elif [ "$IS_LUBAN" = 'is_luban' ]; then
+     end=$(date +%s)
+     echo -e "\n==============================================================\n"
+ 
